@@ -1,0 +1,13 @@
+build/
+filter_app
+
+test
+*.txt
+*.log
+!CMakeLists.txt
+generator.cpp
+test.cpp
+*.zst
+heaptrack.*
+
+.vscode/

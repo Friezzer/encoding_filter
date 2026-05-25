@@ -11,19 +11,13 @@ AppPipeline::AppPipeline(const std::string& in, const std::string& out, const st
 bool AppPipeline::run() {
     std::cout << "=== Запуск конвейера обработки ===\n";
 
-    // ЭТАП 1: Определение кодировки
-    std::cout << "[1/3] Анализ кодировки файла...\n";
-    if (detector.is_valid_utf8_file(input_path)) {
-        detected_encoding = "UTF-8";
-    } else {
-        //todo
-        detected_encoding = "CP1251 (Предположительно)"; 
-    }
-    std::cout << "      Определена кодировка: " << detected_encoding << "\n";
+    // 0. Загружаем модели один раз (обычно это делается в main или конструкторе)
+    detector.init_statistical_models();
 
-    // ЭТАП 2: Настройка Логгера
-    // Передаем логгеру кодировку, чтобы он знал, как декодировать кракозябры
-    logger->set_source_encoding(detected_encoding);
+    // 1. Определение кодировки (одна строчка!)
+    std::cout << "[1/3] Анализ кодировки файла...\n";
+    detected_encoding = detector.detect_encoding(input_path);
+    std::cout << "      Определена кодировка: " << detected_encoding << "\n";
 
     // ЭТАП 3: Основной проход 
     std::cout << "[2/3] Фильтрация ASCII данных...\n";
@@ -47,7 +41,11 @@ bool AppPipeline::run() {
             out_file << line << "\n";
             written++;
         } else {
-            logger->log_discarded_line(line_counter, line, reason);
+            // Детектор сам переводит строку в UTF-8!
+            std::string safe_line = detector.transcode_to_utf8(line, detected_encoding);
+            
+            // Логгер просто записывает готовую безопасную строку
+            logger->log_discarded_line(line_counter, safe_line, reason);
             discarded++;
         }
     }

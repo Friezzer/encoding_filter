@@ -1,5 +1,5 @@
 #include "FilterEngine.hpp"
-#include <iostream>
+
 
 bool FilterEngine::is_ascii_line(const std::string& line, std::string& out_reason) const {
     for (size_t i = 0; i < line.length(); ++i) {

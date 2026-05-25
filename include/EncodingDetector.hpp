@@ -4,6 +4,10 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <math.h>
 #define UTF8_ACCEPT 0
 #define UTF8_REJECT 12
 
@@ -27,9 +31,8 @@ public:
 
     // Главный метод: определяет любую кодировку (UTF-8, CP1251, KOI8-R)
     std::string detect_encoding(const std::string& filepath);
-    // Метод проверки: является ли файл валидным UTF-8?
-    bool is_valid_utf8_file(const std::string& filepath);
 
+    std::string transcode_to_utf8(const std::string& raw_line, const std::string& encoding) const;
 private:
     // Хранилища конфигураций (загружаются в память один раз)
     EncodingMap map_cp1251;
@@ -47,17 +50,19 @@ private:
 
     // Оригинальные элементы для автомата UTF-8
     static const uint8_t utf8d[];
-    static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte);
     bool is_valid_utf8_file(const std::string& filepath);
 
-    // static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
-    //     uint32_t type = utf8d[byte];
+    static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
+        uint32_t type = utf8d[byte];
 
-    //     *codep = (*state != UTF8_ACCEPT) ?
-    //         (byte & 0x3fu) | (*codep << 6) :
-    //         (0xff >> type) & (byte);
+        *codep = (*state != UTF8_ACCEPT) ?
+            (byte & 0x3fu) | (*codep << 6) :
+            (0xff >> type) & (byte);
 
-    //     *state = utf8d[256 + *state + type];
-    //     return *state;
-    // }
+        *state = utf8d[256 + *state + type];
+        return *state;
+    }
+
+    static std::string unicode_to_utf8(uint32_t codepoint);
 };
+

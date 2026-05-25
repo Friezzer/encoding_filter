@@ -2,7 +2,7 @@
 
 #include <string>
 #include <fstream>
-
+#include <iostream>
 class FilterEngine {
 public:
     // Возвращает true, если строка содержит только ASCII (0..127)

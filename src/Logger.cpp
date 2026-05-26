@@ -4,7 +4,7 @@
 Logger::Logger(const std::string& log_path) {
     log_file.open(log_path);
     if (!log_file.is_open()) {
-        std::cerr << "[Warning] Не удалось открыть файл лога: " << log_path << std::endl;
+        std::cerr << "[Warning] Не удалось открыть файл лога: " << log_path << "\n";
     }
 }
 

@@ -63,6 +63,6 @@ private:
         return *state;
     }
 
-    static std::string unicode_to_utf8(uint32_t codepoint);
+    static void unicode_to_utf8(uint32_t codepoint, std::string& out);
 };
 

@@ -25,6 +25,14 @@ bool AppPipeline::run() {
     std::ifstream in_file(input_path, std::ios::binary);
     std::ofstream out_file(output_path, std::ios::binary);
     
+    // Выделяем буферы в памяти
+    std::vector<char> in_buf(65536);
+    std::vector<char> out_buf(65536);
+
+    // Связываем потоки с нашими большими буферами
+    in_file.rdbuf()->pubsetbuf(in_buf.data(), in_buf.size());
+    out_file.rdbuf()->pubsetbuf(out_buf.data(), out_buf.size());
+
     if (!in_file.is_open() || !out_file.is_open()) {
         std::cerr << "Ошибка доступа к файлам.\n";
         return false;

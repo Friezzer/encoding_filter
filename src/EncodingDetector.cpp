@@ -207,8 +207,7 @@ std::string EncodingDetector::detect_encoding(const std::string& filepath) {
 }
 
 // Вспомогательный метод перевода Юникода в байты UTF-8 (из старого логгера)
-std::string EncodingDetector::unicode_to_utf8(uint32_t codepoint) {
-    std::string out = "";
+void EncodingDetector::unicode_to_utf8(uint32_t codepoint, std::string& out) {
     if (codepoint <= 0x7F) {
         out += static_cast<char>(codepoint);
     } else if (codepoint <= 0x7FF) {
@@ -226,7 +225,6 @@ std::string EncodingDetector::unicode_to_utf8(uint32_t codepoint) {
     } else {
         out += "\xEF\xBF\xBD"; 
     }
-    return out;
 }
 
 // Метод транскодирования строки целиком
@@ -235,9 +233,11 @@ std::string EncodingDetector::transcode_to_utf8(const std::string& raw_line, con
         return raw_line;
     }
 
-    // Выбираем нужную приватную карту
     const EncodingMap& map = (encoding == "CP1251") ? map_cp1251 : map_koi8r;
+    
     std::string utf8_line = "";
+    // ОПТИМИЗАЦИЯ: Выделяем память ОДИН раз на всю строку!
+    utf8_line.reserve(raw_line.length() * 2); 
 
     for (size_t i = 0; i < raw_line.length(); ++i) {
         unsigned char c = static_cast<unsigned char>(raw_line[i]);
@@ -246,7 +246,7 @@ std::string EncodingDetector::transcode_to_utf8(const std::string& raw_line, con
         } else {
             uint32_t unicode = map.byte_to_unicode[c];
             if (unicode != 0) {
-                utf8_line += unicode_to_utf8(unicode);
+                unicode_to_utf8(unicode, utf8_line); 
             } else {
                 utf8_line += "\xEF\xBF\xBD";
             }

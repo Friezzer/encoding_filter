@@ -80,7 +80,6 @@ bool EncodingDetector::init_statistical_models() {
 bool EncodingDetector::is_valid_utf8(const char* data, size_t size) {
     uint32_t state = UTF8_ACCEPT;
     uint32_t codepoint = 0;
-
     for (size_t i = 0; i < size; ++i) {
         decode(&state, &codepoint, static_cast<uint8_t>(data[i]));
         if (state == UTF8_REJECT) {
@@ -94,9 +93,7 @@ bool EncodingDetector::is_valid_utf8(const char* data, size_t size) {
 double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_counts, size_t cyrillic_total, 
                                               const EncodingMap& enc, const LanguageFreq& lang) {
     if (cyrillic_total == 0) return 0.0;
-
     std::unordered_map<uint32_t, double> observed_freqs;
-
     // Проекция: переводим байты кодировки в коды Юникода
     for (int b = 128; b < 256; ++b) {
         if (byte_counts[b] == 0) continue;
@@ -135,7 +132,6 @@ double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_co
 }
 
 std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
-    // 1. Проверяем весь mmap-буфер на UTF-8
     if (is_valid_utf8(data, size)) {
         return "UTF-8";
     }
@@ -146,23 +142,35 @@ std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
     size_t cyrillic_total = 0;
     size_t unique_cyrillic = 0;
 
-    // Сэмплирование: читаем не более 50 000 байт прямо из ОЗУ
-    size_t sample_limit = (size < 50000) ? size : 50000;
-    for (size_t i = 0; i < sample_limit; ++i) {
+    // Задаем порог накопления выборки (500 символов кириллицы)
+    const size_t TARGET_CYRILLIC_BYTES = 100; 
+
+    // Адаптивный проход: пропускаем любой объем ASCII, накапливая только кириллицу
+    for (size_t i = 0; i < size; ++i) {
         unsigned char ubyte = static_cast<unsigned char>(data[i]);
-        histogram[ubyte]++;
         
         if (ubyte >= 128) {
+            histogram[ubyte]++;
             cyrillic_total++;
             if (histogram[ubyte] == 1) {
                 unique_cyrillic++;
             }
+
+            // Набрали достаточный объем для статистики - выходим из цикла!
+            if (cyrillic_total >= TARGET_CYRILLIC_BYTES) {
+                break;
+            }
         }
     }
 
-    if (cyrillic_total < 100) return "ASCII";
-    if (unique_cyrillic < 7) return "UNKNOWN";
+    if (cyrillic_total < 100) {
+        return "ASCII"; // Безопасный откат: кириллицы практически нет
+    }
+    if (unique_cyrillic < 7) {
+        return "UNKNOWN"; // Мусорные/бинарные данные
+    }
 
+    // Вычисляем сходство (если у вас остался косинусный метод)
     double score_1251 = calculate_similarity(histogram, cyrillic_total, map_cp1251, freq_russian);
     double score_koi8 = calculate_similarity(histogram, cyrillic_total, map_koi8r, freq_russian);
 
@@ -176,7 +184,7 @@ std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
     return "UNKNOWN";
 }
 
-// Вспомогательный метод перевода Юникода в байты UTF-8 (из старого логгера)
+// Вспомогательный метод перевода Юникода в байты UTF-8
 void EncodingDetector::unicode_to_utf8(uint32_t codepoint, std::string& out) {
     if (codepoint <= 0x7F) {
         out += static_cast<char>(codepoint);
@@ -206,7 +214,6 @@ std::string EncodingDetector::transcode_to_utf8(const std::string& raw_line, con
     const EncodingMap& map = (encoding == "CP1251") ? map_cp1251 : map_koi8r;
     
     std::string utf8_line = "";
-    // ОПТИМИЗАЦИЯ: Выделяем память ОДИН раз на всю строку!
     utf8_line.reserve(raw_line.length() * 2); 
 
     for (size_t i = 0; i < raw_line.length(); ++i) {

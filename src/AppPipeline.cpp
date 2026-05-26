@@ -12,7 +12,7 @@ AppPipeline::AppPipeline(const std::string& in, const std::string& out, const st
     detected_encoding = "UNKNOWN";
 }
 
-// Отображение файла в виртуальную память (mmap)
+// Отображение файла в виртуальную память
 const char* AppPipeline::map_file_to_memory(const std::string& path, size_t& out_size, int& out_fd) {
     out_fd = open(path.c_str(), O_RDONLY);
     if (out_fd == -1) return nullptr;
@@ -50,7 +50,6 @@ void AppPipeline::unmap_file(const char* addr, size_t size, int fd) {
 
 bool AppPipeline::run() {
     std::cout << "=== Запуск конвейера обработки ===\n";
-
     detector.init_statistical_models();
 
     // 1. Отображаем файл в виртуальную память Linux
@@ -83,32 +82,31 @@ bool AppPipeline::run() {
     size_t line_start = 0;
     size_t line_counter = 1;
     size_t discarded = 0;
-
+    size_t error_pos = 0;
+    size_t line_len;
     // Сканируем mmap-буфер построчно по символу '\n'
     for (size_t i = 0; i < file_size; ++i) {
         if (file_data[i] == '\n' || i == file_size - 1) {
-            size_t line_len = i - line_start;
+            line_len = i - line_start;
             if (i == file_size - 1 && file_data[i] != '\n') {
                 line_len++; 
             }
-
-            size_t error_pos = 0;
-            // Быстрая проверка SWAR!
+            error_pos = 0;
             if (filter.check_block_swar(file_data + line_start, line_len, error_pos)) {
                 // Записываем чистые ASCII байты без выделений на куче (Zero-Copy)
                 out_file.write(file_data + line_start, line_len);
                 out_file.put('\n');
             } else {
-                // Нашли не-ASCII. Выделяем временную строку для перекодирования
-                std::string raw_line(file_data + line_start, line_len);
-                
-                // Детектор сам перекодирует её в безопасный UTF-8!
-                std::string safe_line = detector.transcode_to_utf8(raw_line, detected_encoding);
-                
-                std::string reason = "не-ASCII байт на позиции " + std::to_string(error_pos + 1);
-                
-                // Передаем готовую UTF-8 строку в логгер
-                logger->log_discarded_line(line_counter, safe_line, reason);
+               // Если файл уже UTF-8, ASCII или UNKNOWN - пишем напрямую из mmap-памяти без аллокаций!
+                if (detected_encoding == "UTF-8" || detected_encoding == "ASCII" || detected_encoding == "UNKNOWN") {
+                    logger->log_discarded_line(line_counter, file_data + line_start, line_len, error_pos);
+                } else {
+                    // Только для CP1251 и KOI8-R делаем аллокацию и транскодирование
+                    std::string raw_line(file_data + line_start, line_len);
+                    std::string safe_line = detector.transcode_to_utf8(raw_line, detected_encoding);
+                    // Передаем буфер safe_line.data() и его длину safe_line.length() в тот же метод!
+                    logger->log_discarded_line(line_counter, safe_line.data(), safe_line.length(), error_pos);
+                }
                 discarded++;
             }
 
@@ -116,13 +114,10 @@ bool AppPipeline::run() {
             line_counter++;
         }
     }
-
     out_file.close();
     unmap_file(file_data, file_size, fd); // Освобождаем память ОС
-
     std::cout << "[3/3] Обработка завершена.\n";
     std::cout << "      Всего проверено строк: " << line_counter - 1 << "\n";
     std::cout << "      Отброшено строк:        " << discarded << "\n";
-
     return true;
 }

@@ -2,8 +2,8 @@
 #include "AppPipeline.hpp"
 #include <chrono>
 int main(int argc, char* argv[]) {
-    std::ios_base::sync_with_stdio(false);
-    std::cin.tie(nullptr); 
+    //std::ios_base::sync_with_stdio(false);
+    //std::cin.tie(nullptr); 
     if (argc < 4) {
         std::cout << "Использование: " << argv[0] << " <вход> <выход> <лог>\n";
         return 1;

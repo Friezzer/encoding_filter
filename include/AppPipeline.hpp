@@ -15,7 +15,9 @@ private:
     FilterEngine filter;
     EncodingDetector detector;
     std::string detected_encoding; // Сюда сохраним результат
-
+    
+    const char* map_file_to_memory(const std::string& path, size_t& out_size, int& out_fd);
+    void unmap_file(const char* addr, size_t size, int fd);
 public:
     AppPipeline(const std::string& in, const std::string& out, const std::string& log);
     bool run();

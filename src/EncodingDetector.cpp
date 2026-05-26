@@ -77,31 +77,19 @@ bool EncodingDetector::init_statistical_models() {
     return ok;
 }
 
-bool EncodingDetector::is_valid_utf8_file(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "[Detector] Ошибка: не удалось открыть " << filepath << " для анализа.\n";
-        return false;
-    }
-
-    uint32_t state = UTF8_ACCEPT; // 0
+bool EncodingDetector::is_valid_utf8(const char* data, size_t size) {
+    uint32_t state = UTF8_ACCEPT;
     uint32_t codepoint = 0;
-    char byte;
 
-    while (file.get(byte)) {
-        // Передаем байт в функцию (обязательно приводим к uint8_t, чтобы избежать отрицательных значений)
-        decode(&state, &codepoint, static_cast<uint8_t>(byte));
-        
-        // Если попали в состояние ошибки (12), мгновенно прерываем чтение
+    for (size_t i = 0; i < size; ++i) {
+        decode(&state, &codepoint, static_cast<uint8_t>(data[i]));
         if (state == UTF8_REJECT) {
-            file.close();
             return false;
         }
     }
-
-    file.close();
     return state == UTF8_ACCEPT;
 }
+
 
 double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_counts, size_t cyrillic_total, 
                                               const EncodingMap& enc, const LanguageFreq& lang) {
@@ -146,63 +134,45 @@ double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_co
     return dot_product / (std::sqrt(norm_observed) * std::sqrt(norm_expected));
 }
 
-std::string EncodingDetector::detect_encoding(const std::string& filepath) {
-    // 1. Сначала проверяем на UTF-8 с помощью автомата
-    if (is_valid_utf8_file(filepath)) {
+std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
+    // 1. Проверяем весь mmap-буфер на UTF-8
+    if (is_valid_utf8(data, size)) {
         return "UTF-8";
     }
 
-    // 2. Если статистические модели не загружены, сдаемся
     if (!is_initialized) return "UNKNOWN";
 
-    // 3. Открываем файл для сбора статистики (Сэмплирование)
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) return "UNKNOWN";
-
     std::vector<size_t> histogram(256, 0);
-    char byte;
-    size_t total_read = 0;
     size_t cyrillic_total = 0;
     size_t unique_cyrillic = 0;
 
-    // Читаем не более 50 000 байт (Константное время O(1))
-    while (file.get(byte) && total_read < 50000) {
-        unsigned char ubyte = static_cast<unsigned char>(byte); // Каст обязателен!
+    // Сэмплирование: читаем не более 50 000 байт прямо из ОЗУ
+    size_t sample_limit = (size < 50000) ? size : 50000;
+    for (size_t i = 0; i < sample_limit; ++i) {
+        unsigned char ubyte = static_cast<unsigned char>(data[i]);
         histogram[ubyte]++;
         
         if (ubyte >= 128) {
             cyrillic_total++;
             if (histogram[ubyte] == 1) {
-                unique_cyrillic++; // Считаем уникальные кириллические байты
+                unique_cyrillic++;
             }
         }
-        total_read++;
-    }
-    file.close();
-
-    // 4. Эвристические предохранители
-    if (cyrillic_total < 100) {
-        return "ASCII"; // Слишком мало кириллицы, считаем файл латинским
-    }
-    if (unique_cyrillic < 7) {
-        return "UNKNOWN"; // Мусорные/синтетические данные (атака нулевой энтропии)
     }
 
-    // 5. Вычисляем сходство
+    if (cyrillic_total < 100) return "ASCII";
+    if (unique_cyrillic < 7) return "UNKNOWN";
+
     double score_1251 = calculate_similarity(histogram, cyrillic_total, map_cp1251, freq_russian);
     double score_koi8 = calculate_similarity(histogram, cyrillic_total, map_koi8r, freq_russian);
 
-    // Для наглядности при отладке (можно закомментировать позже)
-    // std::cout << "  [Отладка] Сходство CP1251: " << score_1251 << ", KOI8-R: " << score_koi8 << "\n";
-
-    // 6. Принятие решения (Порог доверия)
     const double THRESHOLD = 0.60;
-
     if (score_1251 > THRESHOLD && score_1251 > score_koi8) {
         return "CP1251";
     } else if (score_koi8 > THRESHOLD && score_koi8 > score_1251) {
         return "KOI8-R";
     }
+
     return "UNKNOWN";
 }
 

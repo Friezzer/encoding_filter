@@ -30,7 +30,7 @@ public:
     bool init_statistical_models();
 
     // Главный метод: определяет любую кодировку (UTF-8, CP1251, KOI8-R)
-    std::string detect_encoding(const std::string& filepath);
+    std::string detect_encoding(const char* data, size_t size);
 
     std::string transcode_to_utf8(const std::string& raw_line, const std::string& encoding) const;
 private:
@@ -50,8 +50,8 @@ private:
 
     // Оригинальные элементы для автомата UTF-8
     static const uint8_t utf8d[];
-    bool is_valid_utf8_file(const std::string& filepath);
-
+    bool is_valid_utf8(const char* data, size_t size);
+    
     static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
         uint32_t type = utf8d[byte];
 

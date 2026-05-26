@@ -29,7 +29,7 @@ public:
     // Метод для загрузки конфигурационных файлов (вызывается 1 раз при старте)
     bool init_statistical_models();
 
-    // Главный метод: определяет любую кодировку (UTF-8, CP1251, KOI8-R)
+    // Главный метод: определяет кодировку (UTF-8, CP1251, KOI8-R)
     std::string detect_encoding(const char* data, size_t size);
 
     std::string transcode_to_utf8(const std::string& raw_line, const std::string& encoding) const;

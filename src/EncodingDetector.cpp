@@ -80,7 +80,6 @@ bool EncodingDetector::init_statistical_models() {
 bool EncodingDetector::is_valid_utf8(const char* data, size_t size) {
     uint32_t state = UTF8_ACCEPT;
     uint32_t codepoint = 0;
-
     for (size_t i = 0; i < size; ++i) {
         decode(&state, &codepoint, static_cast<uint8_t>(data[i]));
         if (state == UTF8_REJECT) {
@@ -94,9 +93,7 @@ bool EncodingDetector::is_valid_utf8(const char* data, size_t size) {
 double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_counts, size_t cyrillic_total, 
                                               const EncodingMap& enc, const LanguageFreq& lang) {
     if (cyrillic_total == 0) return 0.0;
-
     std::unordered_map<uint32_t, double> observed_freqs;
-
     // Проекция: переводим байты кодировки в коды Юникода
     for (int b = 128; b < 256; ++b) {
         if (byte_counts[b] == 0) continue;
@@ -176,7 +173,7 @@ std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
     return "UNKNOWN";
 }
 
-// Вспомогательный метод перевода Юникода в байты UTF-8 (из старого логгера)
+// Вспомогательный метод перевода Юникода в байты UTF-8
 void EncodingDetector::unicode_to_utf8(uint32_t codepoint, std::string& out) {
     if (codepoint <= 0x7F) {
         out += static_cast<char>(codepoint);
@@ -206,7 +203,6 @@ std::string EncodingDetector::transcode_to_utf8(const std::string& raw_line, con
     const EncodingMap& map = (encoding == "CP1251") ? map_cp1251 : map_koi8r;
     
     std::string utf8_line = "";
-    // ОПТИМИЗАЦИЯ: Выделяем память ОДИН раз на всю строку!
     utf8_line.reserve(raw_line.length() * 2); 
 
     for (size_t i = 0; i < raw_line.length(); ++i) {

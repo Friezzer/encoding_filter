@@ -15,10 +15,11 @@ Logger::~Logger() {
     }
 }
 
-void Logger::log_discarded_line(size_t line_num, const std::string& safe_line, const std::string& reason) {
+void Logger::log_discarded_line(size_t line_num, const char* data, size_t len, size_t error_pos) {
     if (log_file.is_open()) {
-        log_file << "Строка " << line_num << " ОТБРОШЕНА. Причина: " << reason << "\n";
-        log_file << "Содержимое: " << safe_line << "\n";
-        log_file << "----------------------------------------\n";
+        log_file << "Строка " << line_num << " ОТБРОШЕНА. Причина: не-ASCII байт на позиции " << error_pos + 1 << "\n";
+        log_file << "Содержимое: ";
+        log_file.write(data, len); // Пишем напрямую из переданного буфера памяти
+        log_file << "\n----------------------------------------\n";
     }
 }

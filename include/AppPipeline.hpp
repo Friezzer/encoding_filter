@@ -21,4 +21,8 @@ private:
 public:
     AppPipeline(const std::string& in, const std::string& out, const std::string& log);
     bool run();
+
+    // Поблочный анализ: режет файл на окна фиксированного размера, по каждому
+    // окну определяет кодировку и печатает распределение решений в процентах.
+    bool run_chunk_analysis(size_t chunk_size = 100);
 };

@@ -1,4 +1,6 @@
 #include "EncodingDetector.hpp"
+#include <algorithm>
+#include <cmath>
 
 const uint8_t EncodingDetector::utf8d[] = {
   // Первая часть: 256 байт. Перевод байта в класс (0..11)
@@ -63,13 +65,96 @@ bool EncodingDetector::load_language_freq(const std::string& filepath, LanguageF
     return true;
 }
 
+// Вспомогательный метод перевода 2-байтового UTF-8 символа кириллицы в код Юникода
+uint32_t utf8_char_to_unicode(unsigned char b1, unsigned char b2) {
+    return ((static_cast<uint32_t>(b1) & 0x1F) << 6) | (static_cast<uint32_t>(b2) & 0x3F);
+}
+
+// Парсер вашего формата файлов биграмм
+bool EncodingDetector::load_language_markov(const std::string& filepath, LanguageMarkov& out_markov, const std::string& name) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) return false;
+
+    out_markov.name = name;
+    std::string line_str;
+
+    // Временная структура для хранения сырых данных из файла
+    struct RawTransition {
+        uint32_t prev_uni;
+        uint32_t curr_uni;
+        double abs_freq;
+    };
+    std::vector<RawTransition> raw_list;
+
+    while (std::getline(file, line_str)) {
+        if (line_str.empty() || line_str[0] == '#' || line_str[0] == ';') continue;
+        
+        // Если строка начинается не с цифры — это заголовок таблицы, пропускаем
+        if (!std::isdigit(static_cast<unsigned char>(line_str[0]))) continue;
+
+        std::stringstream ss(line_str);
+        int rank_num;
+        std::string bigram_str;
+        double abs_freq;
+        int ling_rank;
+
+        // Читаем колонки: "1  аб  646284  171"
+        if (ss >> rank_num >> bigram_str >> abs_freq >> ling_rank) {
+            // В кодировке UTF-8 две русские буквы занимают ровно 4 байта
+            if (bigram_str.length() == 4) {
+                uint32_t prev_uni = utf8_char_to_unicode(bigram_str[0], bigram_str[1]);
+                uint32_t curr_uni = utf8_char_to_unicode(bigram_str[2], bigram_str[3]);
+
+                // Регистрируем символы в локальном алфавите
+                if (out_markov.unicode_to_idx.find(prev_uni) == out_markov.unicode_to_idx.end()) {
+                    out_markov.unicode_to_idx[prev_uni] = out_markov.alphabet_size++;
+                }
+                if (out_markov.unicode_to_idx.find(curr_uni) == out_markov.unicode_to_idx.end()) {
+                    out_markov.unicode_to_idx[curr_uni] = out_markov.alphabet_size++;
+                }
+
+                raw_list.push_back({prev_uni, curr_uni, abs_freq});
+            }
+        }
+    }
+    file.close();
+
+    size_t A = out_markov.alphabet_size;
+    if (A == 0) return false;
+
+    // Считаем сумму выходящих переходов для каждого состояния (строки матрицы)
+    std::vector<double> row_sums(A, 0.0);
+    for (const auto& r : raw_list) {
+        size_t idx_prev = out_markov.unicode_to_idx[r.prev_uni];
+        row_sums[idx_prev] += r.abs_freq;
+    }
+
+    // Выделяем память под двумерный вектор и заполняем штрафами -6.0 по умолчанию
+    const double LAPLACE_PENALTY = -12.0; // По требованию: log10(10^-6) = -6
+    out_markov.transition_matrix.assign(A, std::vector<double>(A, LAPLACE_PENALTY));
+
+    // Вычисляем логарифмы переходных вероятностей по основанию 10
+    for (const auto& r : raw_list) {
+        size_t idx_prev = out_markov.unicode_to_idx[r.prev_uni];
+        size_t idx_curr = out_markov.unicode_to_idx[r.curr_uni];
+
+        if (row_sums[idx_prev] > 0.0) {
+            double prob = r.abs_freq / row_sums[idx_prev];
+            out_markov.transition_matrix[idx_prev][idx_curr] = std::log(prob);
+        }
+    }
+
+    return true;
+}
+
 // Инициализация (Вызывается из AppPipeline при старте)
 bool EncodingDetector::init_statistical_models() {
     bool ok = true;
     ok &= load_encoding_map("../config/cp1251.txt", map_cp1251, "CP1251");
     ok &= load_encoding_map("../config/koi8r.txt", map_koi8r, "KOI8-R");
     ok &= load_language_freq("../config/russian.txt", freq_russian, "Russian");
-    
+    // Загружаем марковскую матрицу биграмм (Bigrams) для цепи Маркова
+    ok &= load_language_markov("../config/markov.txt", markov_russian, "Russian_Markov");
     if (!ok) {
         std::cerr << "[Ошибка] Не удалось загрузить файлы конфигурации из папки config/\n";
     }
@@ -131,56 +216,187 @@ double EncodingDetector::calculate_similarity(const std::vector<size_t>& byte_co
     return dot_product / (std::sqrt(norm_observed) * std::sqrt(norm_expected));
 }
 
-std::string EncodingDetector::detect_encoding(const char* data, size_t size) {
+double EncodingDetector::calculate_markov_score(const char* data, size_t size, 
+                                                const EncodingMap& enc, const LanguageMarkov& lang) {
+    if (!is_initialized || lang.alphabet_size == 0) return -9999.0;
+
+    double total_log_prob = 0.0;
+    size_t valid_transitions = 0;
+    int prev_idx = -1;
+
+    // Адаптивное сэмплирование: накапливаем ровно 500 переходов кириллицы
+    const size_t TARGET_TRANSITIONS = 30000; 
+
+    for (size_t i = 0; i < size; ++i) {
+        unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c < 128) {
+            prev_idx = -1; // Сброс окна на латинице
+            continue;
+        }
+
+        uint32_t unicode = enc.byte_to_unicode[c];
+        if (unicode == 0) {
+            prev_idx = -1;
+            continue;
+        }
+
+        // Находим локальный индекс буквы (0..A-1)
+        int curr_idx = -1;
+        auto it_curr = lang.unicode_to_idx.find(unicode);
+        if (it_curr != lang.unicode_to_idx.end()) {
+            curr_idx = static_cast<int>(it_curr->second);
+        }
+
+        if (curr_idx == -1) {
+            prev_idx = -1;
+            continue;
+        }
+
+        if (prev_idx != -1) {
+            // Мгновенный доступ в двумерный вектор переходов
+            total_log_prob += lang.transition_matrix[prev_idx][curr_idx];
+            valid_transitions++;
+
+            // Набрали достаточный объем выборки — прерываем проход
+            if (valid_transitions >= TARGET_TRANSITIONS) {
+                break;
+            }
+        }
+        prev_idx = curr_idx;
+    }
+
+    // Защита от деления на ноль: ни одной биграммы кириллицы не набралось
+    // (буквы есть, но всегда разделены ASCII — патологическое окно).
+    if (valid_transitions == 0) return -9999.0; // нет данных для Маркова -> заведомо проигрышный балл
+    return total_log_prob / valid_transitions;   // нормализованное лог-правдоподобие
+}
+
+// Опционально включить/настроить адаптивный порог косинуса. По умолчанию выключено.
+void EncodingDetector::set_adaptive_cosine_threshold(bool enabled, double T_inf, double T_floor, double k) {
+    adaptive_cosine_threshold = enabled;
+    cosine_T_inf   = T_inf;
+    cosine_T_floor = T_floor;
+    cosine_k       = k;
+}
+
+// Порог принятия для косинуса при текущем объёме выборки N (число кириллических символов).
+// Выключено (по умолчанию): возвращает фиксированный порог — поведение не меняется.
+// Включено: T(N) = clamp(T_inf - k/N, T_floor, T_inf) — низкий на коротких текстах,
+// растёт к асимптоте на длинных (форма мотивирована соотношением 1 - S ~ 1/N).
+double EncodingDetector::get_cosine_threshold(size_t cyrillic_total) const {
+    if (!adaptive_cosine_threshold) {
+        return cosine_threshold_fixed; // прежнее поведение: фиксированные 0.60
+    }
+    if (cyrillic_total == 0) return cosine_T_floor;
+
+    double t = cosine_T_inf - cosine_k / static_cast<double>(cyrillic_total);
+    if (t < cosine_T_floor) t = cosine_T_floor;
+    if (t > cosine_T_inf)   t = cosine_T_inf;
+    return t;
+}
+
+std::string EncodingDetector::detect_encoding(const char* data, size_t size, bool verbose) {
+    // 1. Сначала проверяем на UTF-8 конечным автоматом
     if (is_valid_utf8(data, size)) {
         return "UTF-8";
     }
 
     if (!is_initialized) return "UNKNOWN";
 
+    // Инициализируем переменные для сэмплирования кириллицы
     std::vector<size_t> histogram(256, 0);
     size_t cyrillic_total = 0;
     size_t unique_cyrillic = 0;
+    const size_t TARGET_CYRILLIC_BYTES = 300; 
 
-    // Задаем порог накопления выборки (500 символов кириллицы)
-    const size_t TARGET_CYRILLIC_BYTES = 100; 
-
-    // Адаптивный проход: пропускаем любой объем ASCII, накапливая только кириллицу
+    // Пропускаем ASCII-шум, накапливаем кириллицу для анализа
     for (size_t i = 0; i < size; ++i) {
         unsigned char ubyte = static_cast<unsigned char>(data[i]);
-        
         if (ubyte >= 128) {
             histogram[ubyte]++;
             cyrillic_total++;
             if (histogram[ubyte] == 1) {
                 unique_cyrillic++;
             }
-
-            // Набрали достаточный объем для статистики - выходим из цикла!
             if (cyrillic_total >= TARGET_CYRILLIC_BYTES) {
                 break;
             }
         }
     }
 
-    if (cyrillic_total < 100) {
-        return "ASCII"; // Безопасный откат: кириллицы практически нет
-    }
-    if (unique_cyrillic < 7) {
-        return "UNKNOWN"; // Мусорные/бинарные данные
+    // Предохранители
+    //if (cyrillic_total < 10) return "ASCII";
+    //if (unique_cyrillic < 7) return "UNKNOWN";
+
+    // === ПАРАЛЛЕЛЬНЫЙ РАСЧЕТ ОБОИХ МЕТОДОВ ===
+
+    // Метод 1: Косинусное сходство (Unigrams)
+    double score_1251_cosine = calculate_similarity(histogram, cyrillic_total, map_cp1251, freq_russian);
+    double score_koi8_cosine = calculate_similarity(histogram, cyrillic_total, map_koi8r, freq_russian);
+
+    // Метод 2: Логарифмическое правдоподобие цепи Маркова (Bigrams)
+    double score_1251_markov = calculate_markov_score(data, size, map_cp1251, markov_russian);
+    double score_koi8_markov = calculate_markov_score(data, size, map_koi8r, markov_russian);
+
+    // Пороги принятия решения. Единый источник: одни и те же значения идут
+    // и в диагностическую печать, и в логику решения ниже.
+    // cosine_threshold по умолчанию равен фиксированным 0.60; если включён
+    // адаптивный режим — это T(N), зависящее от длины выборки cyrillic_total.
+    const double MARKOV_THRESHOLD = -4.5;
+    const double cosine_threshold = get_cosine_threshold(cyrillic_total);
+
+
+    if (verbose) {
+    // === ВЫВОД КРАСИВОЙ ОТЛАДОЧНОЙ ДИАГНОСТИКИ В КОНСОЛЬ ===
+    std::cout << "\n-------------------------------------------------------------\n";
+    std::cout << "[Diagnostic] Результаты верификации однобайтовых гипотез:\n";
+    std::cout << "-------------------------------------------------------------\n";
+    std::cout << " Метрика анализа        |    Гипотеза CP1251   |   Гипотеза KOI8-R   \n";
+    std::cout << "-------------------------------------------------------------\n";
+    
+    // Вывод Косинуса (диапазон от 0.0 до 1.0)
+    std::cout << " Косинусное сходство    |        " 
+              << score_1251_cosine << "       |       " 
+              << score_koi8_cosine << "       (Порог: >" << cosine_threshold << ")\n";
+              
+    // Вывод Маркова (диапазон от 0.0 до -12.0)
+    std::cout << " Log-Likelihood Маркова |       " 
+              << score_1251_markov << "       |      " 
+              << score_koi8_markov << "       (Порог: >" << MARKOV_THRESHOLD << ")\n";
+    std::cout << "-------------------------------------------------------------\n";
+
+
     }
 
-    // Вычисляем сходство (если у вас остался косинусный метод)
-    double score_1251 = calculate_similarity(histogram, cyrillic_total, map_cp1251, freq_russian);
-    double score_koi8 = calculate_similarity(histogram, cyrillic_total, map_koi8r, freq_russian);
+    // === ПРИНЯТИЕ РЕШЕНИЯ: косинус — ведущий метод, Марков — арбитр в спорных случаях ===
+    // Пороги MARKOV_THRESHOLD и cosine_threshold уже определены выше.
 
-    const double THRESHOLD = 0.60;
-    if (score_1251 > THRESHOLD && score_1251 > score_koi8) {
-        return "CP1251";
-    } else if (score_koi8 > THRESHOLD && score_koi8 > score_1251) {
-        return "KOI8-R";
+    // Какую кодировку выбирает каждый метод сам по себе (argmax по своему баллу)
+    const std::string cos_pick    = (score_1251_cosine >= score_koi8_cosine) ? "CP1251" : "KOI8-R";
+    const std::string markov_pick = (score_1251_markov >= score_koi8_markov) ? "CP1251" : "KOI8-R";
+
+    const double cos_best    = std::max(score_1251_cosine, score_koi8_cosine);
+    const double markov_best = std::max(score_1251_markov, score_koi8_markov);
+
+    // Косинус считается уверенным, если лучший из двух превышает порог
+    // и при этом строго опережает соперника (нет ничьей).
+    const bool cos_confident    = (cos_best > cosine_threshold) &&
+                                  (std::fabs(score_1251_cosine - score_koi8_cosine) > 1e-9);
+    const bool markov_confident = (markov_best > MARKOV_THRESHOLD);
+    const bool conflict         = (cos_pick != markov_pick);
+
+    // 1) Косинус уверен и согласуется с Марковым -> принимаем выбор косинуса (ведущий метод).
+    if (cos_confident && !conflict) {
+        return cos_pick;
     }
 
+    // 2) Косинус сомневается ИЛИ методы конфликтуют -> решающий голос у Маркова (он сильнее).
+    //    Здесь больше нет старого бага: конфликт ведёт не к UNKNOWN, а к выбору Маркова.
+    if (markov_confident) {
+        return markov_pick;
+    }
+
+    // 3) Ни один метод не уверен -> честный отказ.
     return "UNKNOWN";
 }
 

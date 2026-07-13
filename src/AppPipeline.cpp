@@ -52,6 +52,112 @@ void AppPipeline::unmap_file(const char* addr, size_t size, int fd) {
     }
 }
 
+ChunkResult AppPipeline::process_chunk(const char* data, size_t start_idx, size_t end_idx, const std::string& encoding) {
+    ChunkResult result;
+    result.valid_data.reserve((end_idx - start_idx) * 0.9); // Резерв памяти
+    size_t line_start = start_idx;
+
+    for (size_t i = start_idx; i < end_idx; ++i) {
+        if (data[i] == '\n' || i == end_idx - 1) {
+            size_t line_len = i - line_start;
+            if (i == end_idx - 1 && data[i] != '\n') line_len++;
+
+            size_t error_pos = 0;
+            if (filter.check_block_swar(data + line_start, line_len, error_pos)) {
+                // Валидно: складываем сырые байты в буфер
+                result.valid_data.insert(result.valid_data.end(), data + line_start, data + line_start + line_len);
+                result.valid_data.push_back('\n');
+            } else {
+                // Ошибка: перекодируем и формируем лог
+                std::string raw_line(data + line_start, line_len);
+                std::string safe_line = detector.transcode_to_utf8(raw_line, encoding);
+                std::string log_msg = "ОТБРОШЕНА. Позиция " + std::to_string(error_pos + 1) + 
+                                      "\nСодержимое: " + safe_line + "\n------------------------\n";
+                result.log_entries.push_back(std::move(log_msg));
+                result.lines_discarded++;
+            }
+            result.lines_processed++;
+            line_start = i + 1;
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------
+// 2. РАБОЧИЙ ПОТОК (Хватает задачи из очереди и выполняет)
+// ---------------------------------------------------------
+void AppPipeline::worker_thread(const char* file_data) {
+    while (true) {
+        Task task;
+        {
+            std::unique_lock<std::mutex> lock(task_mtx);
+            // Ждем, пока появится задача ИЛИ пока производитель не скажет "Всё!"
+            task_cv.wait(lock, [this] { return !task_queue.empty() || producer_done; });
+            
+            if (task_queue.empty() && producer_done) return; // Конец работы
+            
+            task = task_queue.front();
+            task_queue.pop();
+        }
+
+        // Фильтруем данные
+        ChunkResult res = process_chunk(file_data, task.start_idx, task.end_idx, detected_encoding);
+        res.id = task.id;
+
+        // Отправляем результат в карту готовых кусков
+        {
+            std::unique_lock<std::mutex> lock(result_mtx);
+            results_map[res.id] = std::move(res);
+        }
+        result_cv.notify_one(); // Будим поток записи!
+    }
+}
+
+// ---------------------------------------------------------
+// 3. ПОТОК ЗАПИСИ (Строго последовательно пишет на диск)
+// ---------------------------------------------------------
+void AppPipeline::writer_thread(size_t& total_processed, size_t& total_discarded) {
+    std::ofstream out_file(output_path, std::ios::binary);
+    std::vector<char> disk_buf(1024 * 1024); // Буфер диска 1 МБ
+    out_file.rdbuf()->pubsetbuf(disk_buf.data(), disk_buf.size());
+
+    while (true) {
+        ChunkResult res;
+        {
+            std::unique_lock<std::mutex> lock(result_mtx);
+            // Ждем, пока появится именно СЛЕДУЮЩИЙ по порядку кусок
+            result_cv.wait(lock, [this] { 
+                return results_map.count(next_write_id) > 0 || (producer_done && active_tasks == 0); 
+            });
+
+            if (results_map.count(next_write_id) == 0 && producer_done && active_tasks == 0) {
+                break; // Всё записано, конец работы!
+            }
+
+            // Забираем нужный кусок
+            res = std::move(results_map[next_write_id]);
+            results_map.erase(next_write_id);
+        }
+
+        // --- ЗАПИСЬ НА ДИСК ---
+        if (!res.valid_data.empty()) {
+            out_file.write(res.valid_data.data(), res.valid_data.size());
+        }
+        for (const auto& log_msg : res.log_entries) {
+            logger->log_discarded_line(0, log_msg.data(), log_msg.length(), 0); // Пишем в лог
+        }
+
+        total_processed += res.lines_processed;
+        total_discarded += res.lines_discarded;
+
+        // Сообщаем, что мы освободили память из-под одного куска!
+        next_write_id++;
+        active_tasks--;
+        bp_cv.notify_one(); // Будим Главный поток, если он ждал из-за нехватки памяти
+    }
+    out_file.close();
+}
+
 bool AppPipeline::run() {
     std::cout << "=== Запуск конвейера обработки ===\n";
     detector.init_statistical_models();
@@ -72,58 +178,68 @@ bool AppPipeline::run() {
 
     // 3. Открываем выходной файл для фильтрации
     std::cout << "[2/3] Фильтрация ASCII данных...\n";
-    std::ofstream out_file(output_path, std::ios::binary);
-    if (!out_file.is_open()) {
-        std::cerr << "Ошибка: не удалось создать выходной файл: " << output_path << "\n";
-        unmap_file(file_data, file_size, fd);
-        return false;
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+
+    size_t total_processed = 0;
+    size_t total_discarded = 0;
+
+    // Запускаем выделенный поток записи на диск
+    std::thread writer(&AppPipeline::writer_thread, this, std::ref(total_processed), std::ref(total_discarded));
+
+    // Создаем ПУЛ ПОТОКОВ-ВЫЧИСЛИТЕЛЕЙ (Thread Pool)
+    std::vector<std::thread> workers;
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        workers.emplace_back(&AppPipeline::worker_thread, this, file_data);
     }
 
-    // Настройка быстрого буфера вывода
-    std::vector<char> out_buf(65536);
-    out_file.rdbuf()->pubsetbuf(out_buf.data(), out_buf.size());
+    // Лимит памяти (Backpressure). Не более 16 кусков в ОЗУ одновременно!
+    const size_t MAX_IN_FLIGHT = 16; 
+    const size_t CHUNK_SIZE = 4 * 1024 * 1024; // 4 Мегабайта
 
-    size_t line_start = 0;
-    size_t line_counter = 1;
-    size_t discarded = 0;
-    size_t error_pos = 0;
-    size_t line_len;
-    std::string safe_line;
-    // Сканируем mmap-буфер построчно по символу '\n'
-    for (size_t i = 0; i < file_size; ++i) {
-        if (file_data[i] == '\n' || i == file_size - 1) {
-            line_len = i - line_start;
-            if (i == file_size - 1 && file_data[i] != '\n') {
-                line_len++; 
-            }
-            error_pos = 0;
-            if (filter.check_block_swar(file_data + line_start, line_len, error_pos)) {
-                // Записываем чистые ASCII байты без выделений на куче (Zero-Copy)
-                out_file.write(file_data + line_start, line_len);
-                out_file.put('\n');
-            } else {
-               // Если файл уже UTF-8, ASCII или UNKNOWN - пишем напрямую из mmap-памяти без аллокаций!
-                if (detected_encoding == "UTF-8" || detected_encoding == "ASCII" || detected_encoding == "UNKNOWN") {
-                    logger->log_discarded_line(line_counter, file_data + line_start, line_len, error_pos);
-                } else {
-                    std::string raw_line(file_data + line_start, line_len);
-                    // Только для CP1251 и KOI8-R делаем аллокацию и транскодирование
-                    safe_line = detector.transcode_to_utf8(raw_line, detected_encoding);
-                    // Передаем буфер safe_line.data() и его длину safe_line.length() в тот же метод!
-                    logger->log_discarded_line(line_counter, safe_line.data(), safe_line.length(), error_pos);
-                }
-                discarded++;
-            }
+    size_t current_start = 0;
+    size_t chunk_id = 0;
 
-            line_start = i + 1;
-            line_counter++;
+    // Главный цикл: режет файл и кидает задачи в очередь
+    while (current_start < file_size) {
+        // Контроль памяти: если активных задач >= 16, останавливаем чтение!
+        {
+            std::unique_lock<std::mutex> lock(bp_mtx);
+            bp_cv.wait(lock, [this] { return active_tasks < MAX_IN_FLIGHT; });
         }
+
+        size_t current_end = current_start + CHUNK_SIZE;
+        if (current_end >= file_size) {
+            current_end = file_size;
+        } else {
+            while (current_end < file_size && file_data[current_end] != '\n') current_end++;
+            if (current_end < file_size) current_end++;
+        }
+
+        // Кидаем задачу в очередь рабочим потокам
+        {
+            std::unique_lock<std::mutex> lock(task_mtx);
+            task_queue.push({chunk_id, current_start, current_end});
+            active_tasks++;
+        }
+        task_cv.notify_one(); // Будим одного свободного рабочего
+
+        current_start = current_end;
+        chunk_id++;
     }
-    out_file.close();
+
+    // Сообщаем всем потокам, что файл закончился
+    producer_done = true;
+    task_cv.notify_all();
+    result_cv.notify_all();
+
+    // Ждем корректного завершения всех потоков
+    for (auto& w : workers) w.join();
+    writer.join();
     unmap_file(file_data, file_size, fd); // Освобождаем память ОС
-    std::cout << "[3/3] Обработка завершена.\n";
-    std::cout << "      Всего проверено строк: " << line_counter - 1 << "\n";
-    std::cout << "      Отброшено строк:        " << discarded << "\n";
+    std::cout << "      Всего проверено строк: " << total_processed << "\n";
+    std::cout << "      Отброшено строк:       " << total_discarded << "\n";
+    std::cout << "      Потоков задействовано: " << num_threads << "\n";
     return true;
 }
 

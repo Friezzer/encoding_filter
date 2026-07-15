@@ -21,7 +21,7 @@ struct Task {
 struct ChunkResult {
     size_t id;
     std::vector<char> valid_data;
-    std::vector<std::string> log_entries;
+    std::vector<char> log_data;
     size_t lines_processed = 0;
     size_t lines_discarded = 0;
 };

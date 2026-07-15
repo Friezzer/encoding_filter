@@ -68,12 +68,17 @@ ChunkResult AppPipeline::process_chunk(const char* data, size_t start_idx, size_
                 result.valid_data.insert(result.valid_data.end(), data + line_start, data + line_start + line_len);
                 result.valid_data.push_back('\n');
             } else {
-                // Ошибка: перекодируем и формируем лог
                 std::string raw_line(data + line_start, line_len);
                 std::string safe_line = detector.transcode_to_utf8(raw_line, encoding);
-                std::string log_msg = "ОТБРОШЕНА. Позиция " + std::to_string(error_pos + 1) + 
-                                      "\nСодержимое: " + safe_line + "\n------------------------\n";
-                result.log_entries.push_back(std::move(log_msg));
+                
+                // Формируем сообщение (можно через обычное сложение, раз мы перекодируем)
+                std::string log_msg = "Строка "
+                                      " ОТБРОШЕНА. Позиция " + std::to_string(error_pos + 1) + 
+                                      "\nСодержимое: " + safe_line + "\n----------------------------------------\n";
+                
+                // ВАЖНО: Вставляем строку напрямую в конец единого вектора байт!
+                result.log_data.insert(result.log_data.end(), log_msg.begin(), log_msg.end());
+                
                 result.lines_discarded++;
             }
             result.lines_processed++;
@@ -117,45 +122,58 @@ void AppPipeline::worker_thread(const char* file_data) {
 // 3. ПОТОК ЗАПИСИ (Строго последовательно пишет на диск)
 // ---------------------------------------------------------
 void AppPipeline::writer_thread(size_t& total_processed, size_t& total_discarded) {
-    std::ofstream out_file(output_path, std::ios::binary);
-    std::vector<char> disk_buf(1024 * 1024); // Буфер диска 1 МБ
-    out_file.rdbuf()->pubsetbuf(disk_buf.data(), disk_buf.size());
+    // Открываем выходной файл системным вызовом
+    int out_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd == -1) {
+        std::cerr << "[Ошибка] Не удалось создать выходной файл: " << output_path << "\n";
+        return;
+    }
 
     while (true) {
         ChunkResult res;
         {
             std::unique_lock<std::mutex> lock(result_mtx);
-            // Ждем, пока появится именно СЛЕДУЮЩИЙ по порядку кусок
             result_cv.wait(lock, [this] { 
                 return results_map.count(next_write_id) > 0 || (producer_done && active_tasks == 0); 
             });
 
             if (results_map.count(next_write_id) == 0 && producer_done && active_tasks == 0) {
-                break; // Всё записано, конец работы!
+                break; // Конец работы
             }
 
-            // Забираем нужный кусок
             res = std::move(results_map[next_write_id]);
             results_map.erase(next_write_id);
         }
 
-        // --- ЗАПИСЬ НА ДИСК ---
+        // --- БЫСТРАЯ СИСТЕМНАЯ ЗАПИСЬ РЕЗУЛЬТАТОВ НА ДИСК ---
         if (!res.valid_data.empty()) {
-            out_file.write(res.valid_data.data(), res.valid_data.size());
+            size_t total_written = 0;
+            size_t to_write = res.valid_data.size();
+            const char* data_ptr = res.valid_data.data();
+
+            // Пишем мегабайтный кусок напрямую в кэш ядра Linux
+            while (total_written < to_write) {
+                ssize_t bytes = write(out_fd, data_ptr + total_written, to_write - total_written);
+                if (bytes <= 0) break; 
+                total_written += bytes;
+            }
         }
-        for (const auto& log_msg : res.log_entries) {
-            logger->log_discarded_line(0, log_msg.data(), log_msg.length(), 0); // Пишем в лог
+
+        // Запись логов через обновленный системный логгер
+        if (!res.log_data.empty()) {
+            logger->write_raw_buffer(res.log_data.data(), res.log_data.size());
         }
 
         total_processed += res.lines_processed;
         total_discarded += res.lines_discarded;
 
-        // Сообщаем, что мы освободили память из-под одного куска!
         next_write_id++;
         active_tasks--;
-        bp_cv.notify_one(); // Будим Главный поток, если он ждал из-за нехватки памяти
+        bp_cv.notify_one(); 
     }
-    out_file.close();
+    
+    // Закрываем дескриптор выходного файла
+    close(out_fd);
 }
 
 bool AppPipeline::run() {

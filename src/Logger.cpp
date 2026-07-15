@@ -1,25 +1,31 @@
 #include "Logger.hpp"
 #include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
 
 Logger::Logger(const std::string& log_path) {
-    log_file.open(log_path);
-    if (!log_file.is_open()) {
+    // Открываем файл: флаги O_WRONLY (запись), O_CREAT (создать), O_TRUNC (очистить)
+    // 0644 - стандартные права доступа Linux (rw-r--r--)
+    log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd == -1) {
         std::cerr << "[Warning] Не удалось открыть файл лога: " << log_path << "\n";
     }
 }
 
-// Деструктор
 Logger::~Logger() {
-    if (log_file.is_open()) {
-        log_file.close();
+    if (log_fd != -1) {
+        close(log_fd);
     }
 }
 
-void Logger::log_discarded_line(size_t line_num, const char* data, size_t len, size_t error_pos) {
-    if (log_file.is_open()) {
-        log_file << "Строка " << line_num << " ОТБРОШЕНА. Причина: не-ASCII байт на позиции " << error_pos + 1 << "\n";
-        log_file << "Содержимое: ";
-        log_file.write(data, len); // Пишем напрямую из переданного буфера памяти
-        log_file << "\n----------------------------------------\n";
+void Logger::write_raw_buffer(const char* data, size_t len) {
+    if (log_fd == -1 || len == 0) return;
+
+    size_t total_written = 0;
+    // Цикл гарантирует, что ядро ОС запишет все байты до конца
+    while (total_written < len) {
+        ssize_t bytes = write(log_fd, data + total_written, len - total_written);
+        if (bytes <= 0) break; // Ошибка записи (например, закончилось место на диске)
+        total_written += bytes;
     }
 }

@@ -5,10 +5,12 @@
 
 class Logger {
 private:
-    std::ofstream log_file;
+    int log_fd; // Системный файловый дескриптор (вместо std::ofstream)
+
 public:
     Logger(const std::string& log_path);
     ~Logger();
-    // Метод логирования отброшенной строки
-    void log_discarded_line(size_t line_num, const char* data, size_t len, size_t error_pos);
+
+    // Универсальный метод записи готового буфера через write()
+    void write_raw_buffer(const char* data, size_t len);
 };

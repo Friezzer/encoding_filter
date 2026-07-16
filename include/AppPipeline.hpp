@@ -37,7 +37,6 @@ private:
     EncodingDetector detector;
     std::string detected_encoding; // Сюда сохраним результат
     
-     // --- Многопоточные примитивы (Thread Pool & Queues) ---
     std::mutex task_mtx;
     std::condition_variable task_cv;
     std::queue<Task> task_queue;
@@ -46,7 +45,7 @@ private:
     std::condition_variable result_cv;
     std::unordered_map<size_t, ChunkResult> results_map;
 
-    std::mutex bp_mtx; // Мьютекс для обратного давления (Backpressure)
+    std::mutex bp_mtx;
     std::condition_variable bp_cv;
     
     std::atomic<size_t> active_tasks{0};     // Сколько задач сейчас в ОЗУ
@@ -64,7 +63,5 @@ public:
     AppPipeline(const std::string& in, const std::string& out, const std::string& log);
     bool run();
 
-    // Поблочный анализ: режет файл на окна фиксированного размера, по каждому
-    // окну определяет кодировку и печатает распределение решений в процентах.
     bool run_chunk_analysis(size_t chunk_size = 100);
 };

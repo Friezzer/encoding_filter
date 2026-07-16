@@ -16,10 +16,10 @@ bool FilterEngine::check_block_swar(const char* data, size_t size, size_t& out_e
     size_t i = 0;
     const uint64_t mask = 0x8080808080808080ULL; // Маска старшего бита для 8 байт
 
-    // Сканируем быстрыми блоками по 8 байт (64 бита) за одну инструкцию!
+    // Сканируем быстрыми блоками по 8 байт
     for (; i + 8 <= size; i += 8) {
         uint64_t chunk;
-        std::memcpy(&chunk, data + i, 8); // Безопасное копирование в регистр
+        std::memcpy(&chunk, data + i, 8); // копирование в регистр
 
         if ((chunk & mask) != 0) {
             // Если нашли плохой байт, локализуем его внутри этого блока

@@ -15,8 +15,7 @@ int main(int argc, char* argv[]) {
     AppPipeline app(argv[1], argv[2], argv[3]);
     auto start = std::chrono::high_resolution_clock::now();
 
-    // Если передан 4-й аргумент — это размер блока, запускаем поблочный анализ кодировки.
-    // strtoul вернёт 0 при нечисловом вводе, а run_chunk_analysis сам заменит 0 на 100.
+    // Если передан 4-й аргумент - размер блока, запускаем поблочный анализ кодировки.
     bool ok;
     if (argc >= 5) {
         size_t chunk_size = static_cast<size_t>(std::strtoul(argv[4], nullptr, 10));
@@ -29,8 +28,8 @@ int main(int argc, char* argv[]) {
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = end - start;
         std::cout << "Время выполнения: " << elapsed.count() << " мс" << "\n";
-        return 0; // Успех
+        return 0; 
     }
     
-    return 1; // Системная ошибка
+    return 1;
 }

@@ -5,12 +5,12 @@
 
 class Logger {
 private:
-    int log_fd; // Системный файловый дескриптор (вместо std::ofstream)
+    int log_fd; // Системный файловый дескриптор
 
 public:
     Logger(const std::string& log_path);
     ~Logger();
 
-    // Универсальный метод записи готового буфера через write()
+    // метод записи готового буфера 
     void write_raw_buffer(const char* data, size_t len);
 };

@@ -52,39 +52,78 @@ void AppPipeline::unmap_file(const char* addr, size_t size, int fd) {
     }
 }
 
-ChunkResult AppPipeline::process_chunk(const char* data, size_t start_idx, size_t end_idx, const std::string& encoding) {
+ChunkResult AppPipeline::process_chunk(const char* data, size_t start_idx, size_t end_idx, 
+                                       const std::string& encoding, size_t start_line) {
     ChunkResult result;
-    result.valid_data.reserve((end_idx - start_idx) * 0.9); // Резерв памяти
+    result.valid_data.reserve(end_idx - start_idx);
+    result.log_data.reserve(end_idx - start_idx);
     size_t line_start = start_idx;
+    size_t valid_block_start = start_idx; // Указатель начала непрерывного ASCII-блока
+    size_t error_pos = 0;
+    size_t current_line_num = start_line; // Потокобезопасный локальный счетчик строк
+
+    // Быстрые не-конкатенирующие лямбды для записи в буфер лога
+    auto append_to_buf = [](std::vector<char>& buf, const char* str, size_t len) {
+        buf.insert(buf.end(), str, str + len);
+    };
+
+    auto append_num_to_buf = [](std::vector<char>& buf, size_t num) {
+        char temp[32];
+        int len = std::snprintf(temp, sizeof(temp), "%zu", num);
+        buf.insert(buf.end(), temp, temp + len);
+    };
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         if (data[i] == '\n' || i == end_idx - 1) {
             size_t line_len = i - line_start;
-            if (i == end_idx - 1 && data[i] != '\n') line_len++;
+            bool has_newline = (data[i] == '\n');
+            if (!has_newline && i == end_idx - 1) line_len++;
 
-            size_t error_pos = 0;
             if (filter.check_block_swar(data + line_start, line_len, error_pos)) {
-                // Валидно: складываем сырые байты в буфер
-                result.valid_data.insert(result.valid_data.end(), data + line_start, data + line_start + line_len);
-                result.valid_data.push_back('\n');
+                // Строка чистая: ничего не делаем, позволяем ASCII-блоку расти
             } else {
+                // Строка содержит не-ASCII:
+                // 1. Сбрасываем весь накопленный ASCII-блок одним быстрым вызовом insert (memcpy)
+                if (line_start > valid_block_start) {
+                    result.valid_data.insert(result.valid_data.end(), 
+                                             data + valid_block_start, 
+                                             data + line_start);
+                }
+
+                // 2. Декодируем плохую строку
                 std::string raw_line(data + line_start, line_len);
                 std::string safe_line = detector.transcode_to_utf8(raw_line, encoding);
+
+                // 3. Форматируем и пишем лог напрямую в байтовый вектор log_data без создания std::string
+                append_to_buf(result.log_data, "Строка ", 14); // Длина UTF-8 префикса в байтах
+                append_num_to_buf(result.log_data, current_line_num);
+                append_to_buf(result.log_data, " ОТБРОШЕНА. Причина: не-ASCII байт на позиции ", 38);
+                append_num_to_buf(result.log_data, error_pos + 1);
+                append_to_buf(result.log_data, "\nСодержимое: ", 25);
                 
-                // Формируем сообщение (можно через обычное сложение, раз мы перекодируем)
-                std::string log_msg = "Строка "
-                                      " ОТБРОШЕНА. Позиция " + std::to_string(error_pos + 1) + 
-                                      "\nСодержимое: " + safe_line + "\n----------------------------------------\n";
+                // Записываем саму декодированную строку
+                append_to_buf(result.log_data, safe_line.data(), safe_line.length());
                 
-                // ВАЖНО: Вставляем строку напрямую в конец единого вектора байт!
-                result.log_data.insert(result.log_data.end(), log_msg.begin(), log_msg.end());
-                
+                append_to_buf(result.log_data, "\n----------------------------------------\n", 42);
+
                 result.lines_discarded++;
+
+                // 4. Сдвигаем начало следующего ASCII-блока на строку, идущую за ошибкой
+                valid_block_start = i + 1;
             }
             result.lines_processed++;
+            current_line_num++;
             line_start = i + 1;
         }
     }
+
+    // В конце чанка сбрасываем остаток чистых строк (если они были на конце)
+    if (valid_block_start < end_idx) {
+        result.valid_data.insert(result.valid_data.end(), 
+                                 data + valid_block_start, 
+                                 data + end_idx);
+    }
+
     return result;
 }
 
@@ -96,25 +135,23 @@ void AppPipeline::worker_thread(const char* file_data) {
         Task task;
         {
             std::unique_lock<std::mutex> lock(task_mtx);
-            // Ждем, пока появится задача ИЛИ пока производитель не скажет "Всё!"
             task_cv.wait(lock, [this] { return !task_queue.empty() || producer_done; });
             
-            if (task_queue.empty() && producer_done) return; // Конец работы
+            if (task_queue.empty() && producer_done) return; 
             
             task = task_queue.front();
             task_queue.pop();
         }
 
-        // Фильтруем данные
-        ChunkResult res = process_chunk(file_data, task.start_idx, task.end_idx, detected_encoding);
+        // Фильтруем данные, передавая параметр task.start_line из очереди!
+        ChunkResult res = process_chunk(file_data, task.start_idx, task.end_idx, detected_encoding, task.start_line);
         res.id = task.id;
 
-        // Отправляем результат в карту готовых кусков
         {
             std::unique_lock<std::mutex> lock(result_mtx);
             results_map[res.id] = std::move(res);
         }
-        result_cv.notify_one(); // Будим поток записи!
+        result_cv.notify_one(); 
     }
 }
 
@@ -217,30 +254,53 @@ bool AppPipeline::run() {
 
     size_t current_start = 0;
     size_t chunk_id = 0;
-
+    size_t global_line_counter = 1; 
     // Главный цикл: режет файл и кидает задачи в очередь
     while (current_start < file_size) {
-        // Контроль памяти: если активных задач >= 16, останавливаем чтение!
+        // Контроль памяти (Backpressure)
         {
             std::unique_lock<std::mutex> lock(bp_mtx);
             bp_cv.wait(lock, [this] { return active_tasks < MAX_IN_FLIGHT; });
         }
 
         size_t current_end = current_start + CHUNK_SIZE;
-        if (current_end >= file_size) {
-            current_end = file_size;
-        } else {
-            while (current_end < file_size && file_data[current_end] != '\n') current_end++;
-            if (current_end < file_size) current_end++;
+        size_t lines_in_this_chunk = 0; // Сюда посчитаем строки текущего куска
+
+        // 1. Считаем количество новых строк (\n) в базовом куске
+        for (size_t k = current_start; k < current_end && k < file_size; ++k) {
+            if (file_data[k] == '\n') {
+                lines_in_this_chunk++;
+            }
         }
 
-        // Кидаем задачу в очередь рабочим потокам
+        if (current_end >= file_size) {
+            current_end = file_size;
+            // Если самый конец файла не заканчивается на '\n', добавляем последнюю строку
+            if (file_size > 0 && file_data[file_size - 1] != '\n') {
+                lines_in_this_chunk++;
+            }
+        } else {
+            // 2. Сдвигаем конец чанка вправо до ближайшего '\n' (Boundary Alignment)
+            // И одновременно продолжаем считать строки!
+            while (current_end < file_size && file_data[current_end] != '\n') {
+                current_end++;
+            }
+            if (current_end < file_size) {
+                current_end++; // Включаем сам '\n'
+                lines_in_this_chunk++; // Считаем этот пограничный '\n'
+            }
+        }
+
+        // Кидаем задачу в очередь, передавая в качестве start_line текущий глобальный счетчик строк
         {
             std::unique_lock<std::mutex> lock(task_mtx);
-            task_queue.push({chunk_id, current_start, current_end});
+            task_queue.push({chunk_id, current_start, current_end, global_line_counter});
             active_tasks++;
         }
-        task_cv.notify_one(); // Будим одного свободного рабочего
+        task_cv.notify_one();
+
+        // 3. Рассчитываем стартовый номер строки для СЛЕДУЮЩЕГО чанка
+        global_line_counter += lines_in_this_chunk;
 
         current_start = current_end;
         chunk_id++;

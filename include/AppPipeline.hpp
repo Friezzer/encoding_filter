@@ -15,6 +15,7 @@ struct Task {
     size_t id;
     size_t start_idx;
     size_t end_idx;
+    size_t start_line;
 };
 
 // Контейнер для результатов работы потока
@@ -55,7 +56,7 @@ private:
     const char* map_file_to_memory(const std::string& path, size_t& out_size, int& out_fd);
     void unmap_file(const char* addr, size_t size, int fd);
     // Методы многопоточной обработки
-    ChunkResult process_chunk(const char* data, size_t start_idx, size_t end_idx, const std::string& encoding);
+    ChunkResult process_chunk(const char* data, size_t start_idx, size_t end_idx, const std::string& encoding, size_t start_line);
     void worker_thread(const char* file_data);
     void writer_thread(size_t& total_processed, size_t& total_discarded);
 
